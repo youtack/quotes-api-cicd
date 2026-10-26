@@ -1,0 +1,157 @@
+name: CD
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to deploy and tag, for example v1.0.0"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cd-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to server
+    runs-on: ubuntu-latest
+    env:
+      SERVER_HOST: ${{ vars.SERVER_HOST }}
+      SERVER_USER: ${{ vars.SERVER_USER }}
+      APP_DIR: ${{ vars.APP_DIR }}
+      SERVICE_NAME: ${{ vars.SERVICE_NAME }}
+      APP_PORT: ${{ vars.APP_PORT }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate inputs
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version must look like v1.2.3"; exit 1
+          fi
+          for name in SERVER_HOST SERVER_USER APP_DIR SERVICE_NAME APP_PORT SSH_PRIVATE_KEY; do
+            if [ -z "${!name}" ]; then
+              echo "::error::$name is not set (Settings, Secrets and variables, Actions)"; exit 1
+            fi
+          done
+          if git ls-remote --exit-code --tags origin "refs/tags/$VERSION" > /dev/null 2>&1; then
+            echo "::error::tag $VERSION already exists; choose the next version"; exit 1
+          fi
+          echo "RELEASE=${VERSION}-$(date -u +%Y%m%d%H%M%S)" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install production dependencies
+        run: npm ci --omit=dev
+
+      - name: Configure SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -T 15 -H "$SERVER_HOST" >> ~/.ssh/known_hosts
+          if [ ! -s ~/.ssh/known_hosts ]; then
+            echo "::error::could not reach $SERVER_HOST on port 22"; exit 1
+          fi
+          cat > ~/.ssh/config <<EOF
+          Host target
+            HostName $SERVER_HOST
+            User $SERVER_USER
+            IdentityFile ~/.ssh/id_ed25519
+            IdentitiesOnly yes
+            BatchMode yes
+            ConnectTimeout 15
+            StrictHostKeyChecking yes
+          EOF
+          ssh target 'echo SSH OK as $(whoami) on $(hostname)'
+
+      - name: Record previous release
+        run: |
+          PREV=$(ssh target "if [ -L $APP_DIR/current ]; then readlink -f $APP_DIR/current; fi")
+          echo "PREV_RELEASE=$PREV" >> "$GITHUB_ENV"
+          echo "Previous release: ${PREV:-none (first deploy)}"
+
+      - name: Upload new release
+        run: |
+          ssh target "mkdir -p $APP_DIR/releases/$RELEASE"
+          rsync -az --delete \
+            --exclude='.git' --exclude='.github' --exclude='tests' \
+            --exclude='coverage' --exclude='eslint.config.js' \
+            ./ "target:$APP_DIR/releases/$RELEASE/"
+
+      - name: Switch symlink, restart service, reload nginx
+        run: |
+          echo "SWITCHED=true" >> "$GITHUB_ENV"
+          ssh target "cd $APP_DIR && ln -sfn releases/$RELEASE current.tmp && mv -Tf current.tmp current"
+          ssh target "sudo -n systemctl restart $SERVICE_NAME && sudo -n nginx -s reload"
+
+      - name: Health check through nginx
+        run: |
+          for i in $(seq 1 10); do
+            health=$(ssh target "curl -fsS --max-time 5 http://127.0.0.1:$APP_PORT/health" 2>/dev/null || true)
+            version=$(ssh target "curl -fsS --max-time 5 http://127.0.0.1:$APP_PORT/api/version" 2>/dev/null || true)
+            if echo "$health" | grep -q '"status":"ok"' && echo "$version" | grep -q '"name":"quotes-api"'; then
+              echo "Healthy on attempt $i"; exit 0
+            fi
+            echo "Attempt $i/10 not healthy, retrying in 3s"; sleep 3
+          done
+          echo "::error::Health check failed"; exit 1
+
+      - name: Roll back to the previous release
+        if: failure() && env.SWITCHED == 'true'
+        run: |
+          if [ -z "$PREV_RELEASE" ]; then
+            echo "::error::Deploy of $RELEASE failed and there is no previous release to roll back to."; exit 1
+          fi
+          PREV_NAME=$(basename "$PREV_RELEASE")
+          ssh target "cd $APP_DIR && ln -sfn releases/$PREV_NAME current.tmp && mv -Tf current.tmp current && sudo -n systemctl restart $SERVICE_NAME"
+          echo "::error::Deploy of $RELEASE FAILED its health check. Rolled back to $PREV_NAME."
+          exit 1
+
+      - name: Prune old releases
+        run: |
+          ssh target bash -s -- "$APP_DIR" <<'REMOTE'
+          set -euo pipefail
+          cd "$1/releases"
+          live=$(basename "$(readlink -f ../current)")
+          { ls -1dt -- * | grep -vxF -- "$live" || true; } | tail -n +5 | xargs -r rm -rf --
+          REMOTE
+
+      - name: Summary
+        run: |
+          {
+            echo "## Deployed ${VERSION}"
+            echo "- Release dir: \`$APP_DIR/releases/$RELEASE\`"
+            echo "- Previous release: \`${PREV_RELEASE:-none}\`"
+            echo "- Check: http://$SERVER_HOST:$APP_PORT/api/quotes"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  tag:
+    name: Tag release
+    needs: deploy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create GitHub release (also creates the git tag)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          gh release create "$VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$VERSION" \
+            --generate-notes
